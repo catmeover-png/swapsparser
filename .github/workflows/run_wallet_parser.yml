@@ -1,0 +1,36 @@
+name: Run Wallet Parser
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily at 07:00 UTC
+    - cron: "0 7 * * *"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run parser
+        env:
+          BASESCAN_API_KEY: ${{ secrets.BASESCAN_API_KEY }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          LMTS_ADDRESS: ${{ secrets.LMTS_ADDRESS }}
+          USDC_ADDRESS: ${{ secrets.USDC_ADDRESS }}
+          RATE_LIMIT_RPS: "4"
+        run: |
+          python wallet_parser.py
