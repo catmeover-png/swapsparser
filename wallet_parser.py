@@ -13,10 +13,10 @@ Writes:
 - Final
 
 API:
-- Etherscan v2 multichain endpoint with chainid=8453 for Base
+- Alchemy JSON-RPC on Base mainnet (alchemy_getAssetTransfers)
 
 Required env vars for GitHub Actions:
-- BASESCAN_API_KEY
+- BASESCAN_API_KEY  (kept name for backwards compat — actually holds Alchemy key)
 - GOOGLE_SHEET_ID or GSHEET_ID
 - GOOGLE_SERVICE_ACCOUNT_JSON
 
@@ -24,6 +24,7 @@ Optional env vars:
 - LMTS_ADDRESS
 - USDC_ADDRESS
 - RATE_LIMIT_RPS
+- ALCHEMY_BASE_URL  (override base URL, default: https://base-mainnet.g.alchemy.com/v2)
 """
 
 import os
@@ -54,9 +55,9 @@ log = logging.getLogger("wallet_parser")
 # ENV CONFIG
 # =========================
 
-BASESCAN_API_URL = os.getenv("BASESCAN_API_URL", "https://api.etherscan.io/v2/api")
-BASESCAN_API_KEY = os.getenv("BASESCAN_API_KEY", "").strip()
-BASE_CHAIN_ID = os.getenv("BASE_CHAIN_ID", "8453")
+# BASESCAN_API_KEY env var holds the Alchemy API key (name kept for GH Actions compat).
+ALCHEMY_API_KEY = os.getenv("BASESCAN_API_KEY", "").strip()
+ALCHEMY_BASE_URL = os.getenv("ALCHEMY_BASE_URL", "https://base-mainnet.g.alchemy.com/v2").strip()
 RATE_LIMIT_RPS = int(os.getenv("RATE_LIMIT_RPS", "4"))
 
 GOOGLE_SHEET_ID = (
@@ -185,6 +186,19 @@ def ts_to_utc_str(ts: int) -> str:
     return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def parse_iso_to_ts(iso_str: str) -> int:
+    """Parse Alchemy's ISO8601 blockTimestamp like '2024-04-15T12:34:56.000Z' → unix ts."""
+    if not iso_str:
+        return 0
+    s = iso_str.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return int(datetime.fromisoformat(s).timestamp())
+    except ValueError:
+        return 0
+
+
 def dec_to_str(value: Any) -> str:
     if value is None:
         return ""
@@ -196,8 +210,20 @@ def dec_to_str(value: Any) -> str:
     return str(value)
 
 
-def amount_from_raw(raw_value: str, decimals: str | int) -> Decimal:
-    return Decimal(str(raw_value or "0")) / (Decimal(10) ** int(decimals or 0))
+def hex_to_int(value: str) -> int:
+    if not value:
+        return 0
+    s = str(value).strip()
+    if s.startswith("0x") or s.startswith("0X"):
+        return int(s, 16)
+    return int(s)
+
+
+def amount_from_raw_hex(raw_hex: str, decimals_hex: str) -> Decimal:
+    """Alchemy returns rawContract.value as hex string and rawContract.decimal as hex string."""
+    raw_int = hex_to_int(raw_hex)
+    dec_int = hex_to_int(decimals_hex) if decimals_hex else 0
+    return Decimal(raw_int) / (Decimal(10) ** dec_int)
 
 
 def direction_for_wallet(wallet: str, from_addr: str, to_addr: str) -> str:
@@ -210,7 +236,7 @@ def direction_for_wallet(wallet: str, from_addr: str, to_addr: str) -> str:
 
 
 # =========================
-# BASESCAN CLIENT
+# ALCHEMY CLIENT
 # =========================
 
 class RateLimiter:
@@ -227,16 +253,26 @@ class RateLimiter:
 
 
 _limiter = RateLimiter(RATE_LIMIT_RPS)
+_request_id = 0
 
 
-def basescan_request(params: dict[str, Any], max_retries: int = 5) -> dict[str, Any]:
-    if not BASESCAN_API_KEY:
-        raise RuntimeError("BASESCAN_API_KEY is missing")
+def _next_id() -> int:
+    global _request_id
+    _request_id += 1
+    return _request_id
 
-    params = {
-        **params,
-        "chainid": BASE_CHAIN_ID,
-        "apikey": BASESCAN_API_KEY,
+
+def alchemy_rpc(method: str, params: list[Any], max_retries: int = 5) -> Any:
+    """Generic Alchemy JSON-RPC call with retries and rate limiting."""
+    if not ALCHEMY_API_KEY:
+        raise RuntimeError("BASESCAN_API_KEY (Alchemy key) is missing")
+
+    url = f"{ALCHEMY_BASE_URL}/{ALCHEMY_API_KEY}"
+    payload = {
+        "jsonrpc": "2.0",
+        "id": _next_id(),
+        "method": method,
+        "params": params,
     }
 
     backoff = 1.0
@@ -245,7 +281,12 @@ def basescan_request(params: dict[str, Any], max_retries: int = 5) -> dict[str, 
         _limiter.wait()
 
         try:
-            response = requests.get(BASESCAN_API_URL, params=params, timeout=30)
+            response = requests.post(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=60,
+            )
         except requests.RequestException as e:
             log.warning("Network error: %s | attempt=%s", e, attempt + 1)
             time.sleep(backoff)
@@ -274,92 +315,116 @@ def basescan_request(params: dict[str, Any], max_retries: int = 5) -> dict[str, 
             backoff *= 2
             continue
 
-        msg = (data.get("message") or "").lower()
-        result = data.get("result")
+        if "error" in data and data["error"]:
+            err = data["error"]
+            err_msg = str(err.get("message", "")).lower()
+            err_code = err.get("code")
 
-        if data.get("status") == "0":
-            if "no transactions" in msg or "no records" in msg:
-                return {"status": "0", "result": []}
-
-            if "rate limit" in msg or "max rate" in msg or "max calls" in msg:
-                log.warning("API rate limit message=%r, sleeping %.1fs", msg, backoff)
+            # Retry on transient errors
+            if "rate limit" in err_msg or "too many" in err_msg or err_code == 429:
+                log.warning("RPC rate limit: %s, sleeping %.1fs", err, backoff)
                 time.sleep(backoff)
                 backoff *= 2
                 continue
 
-            # Critical API errors should not silently become "no rows".
-            raise RuntimeError(f"BaseScan API error: message={msg!r}, result={result!r}")
+            raise RuntimeError(f"Alchemy RPC error: {err}")
 
-        return data
+        return data.get("result")
 
-    raise RuntimeError(f"BaseScan request failed after {max_retries} retries: {params}")
-
-
-def get_block_by_timestamp(ts_unix: int, closest: str = "before") -> int:
-    data = basescan_request({
-        "module": "block",
-        "action": "getblocknobytime",
-        "timestamp": int(ts_unix),
-        "closest": closest,
-    })
-    return int(data["result"])
+    raise RuntimeError(f"Alchemy request failed after {max_retries} retries: method={method}")
 
 
-def fetch_token_transfer_page(wallet: str, start_block: int, end_block: int, page: int, offset: int = 1000) -> list[dict]:
-    data = basescan_request({
-        "module": "account",
-        "action": "tokentx",
-        "address": norm_addr(wallet),
-        "startblock": int(start_block),
-        "endblock": int(end_block),
-        "page": int(page),
-        "offset": int(offset),
-        "sort": "asc",
-    })
-    return data.get("result") or []
+def get_asset_transfers_page(
+    *,
+    from_address: str | None = None,
+    to_address: str | None = None,
+    contract_addresses: list[str],
+    from_block: str = "0x0",
+    to_block: str = "latest",
+    page_key: str | None = None,
+    max_count: str = "0x3e8",  # 1000
+) -> dict[str, Any]:
+    """Single page of alchemy_getAssetTransfers."""
+    params: dict[str, Any] = {
+        "fromBlock": from_block,
+        "toBlock": to_block,
+        "category": ["erc20"],
+        "contractAddresses": contract_addresses,
+        "withMetadata": True,
+        "excludeZeroValue": True,
+        "maxCount": max_count,
+        "order": "asc",
+    }
+    if from_address:
+        params["fromAddress"] = from_address
+    if to_address:
+        params["toAddress"] = to_address
+    if page_key:
+        params["pageKey"] = page_key
+
+    return alchemy_rpc("alchemy_getAssetTransfers", [params]) or {}
 
 
-def iter_token_transfers(wallet: str, start_block: int, end_block: int, page_size: int = 1000) -> Iterable[dict]:
-    """
-    Yield ERC-20 transfers for a wallet.
+def fetch_all_transfers_one_direction(
+    *,
+    wallet: str,
+    direction: str,  # "from" or "to"
+    contract_addresses: list[str],
+) -> list[dict]:
+    """Fetch all pages for either incoming or outgoing transfers for the wallet."""
+    rows: list[dict] = []
+    page_key: str | None = None
+    safety_pages = 0
 
-    Safe pagination:
-    - If the 10-page cap is hit, split the whole block range.
-    - We do not yield partial data before splitting, to avoid duplicates.
-    """
-    if start_block > end_block:
-        return
+    while True:
+        kwargs: dict[str, Any] = {
+            "contract_addresses": contract_addresses,
+            "page_key": page_key,
+        }
+        if direction == "from":
+            kwargs["from_address"] = wallet
+        else:
+            kwargs["to_address"] = wallet
 
-    collected: list[dict] = []
+        result = get_asset_transfers_page(**kwargs)
+        page_rows = result.get("transfers") or []
+        rows.extend(page_rows)
 
-    for page in range(1, 11):
-        rows = fetch_token_transfer_page(wallet, start_block, end_block, page, page_size)
-        if not rows:
-            for r in collected:
-                yield r
-            return
+        page_key = result.get("pageKey") or None
+        safety_pages += 1
 
-        collected.extend(rows)
+        if not page_key:
+            break
 
-        if len(rows) < page_size:
-            for r in collected:
-                yield r
-            return
+        if safety_pages > 200:
+            log.warning("Stopping pagination at %s pages for safety (wallet=%s, dir=%s)",
+                        safety_pages, wallet, direction)
+            break
 
-    # If page 10 is full, the range may be capped. Split safely.
-    if start_block == end_block:
-        raise RuntimeError(
-            f"Too many token transfers in a single block={start_block} for wallet={wallet}"
-        )
+    return rows
 
-    mid = (start_block + end_block) // 2
-    log.info(
-        "Pagination cap risk for wallet=%s range=[%s..%s], splitting [%s..%s] and [%s..%s]",
-        wallet, start_block, end_block, start_block, mid, mid + 1, end_block,
+
+def fetch_wallet_transfers(wallet: str, contract_addresses: list[str]) -> list[dict]:
+    """Two calls per wallet: outgoing (from=wallet) + incoming (to=wallet)."""
+    out_rows = fetch_all_transfers_one_direction(
+        wallet=wallet, direction="from", contract_addresses=contract_addresses,
+    )
+    in_rows = fetch_all_transfers_one_direction(
+        wallet=wallet, direction="to", contract_addresses=contract_addresses,
     )
 
-    yield from iter_token_transfers(wallet, start_block, mid, page_size)
-    yield from iter_token_transfers(wallet, mid + 1, end_block, page_size)
+    # Dedup by uniqueId — incoming and outgoing should be disjoint by construction,
+    # but if wallet sent to itself this protects us.
+    seen: set[str] = set()
+    merged: list[dict] = []
+    for r in out_rows + in_rows:
+        uid = r.get("uniqueId") or f"{r.get('hash')}:{r.get('rawContract', {}).get('value')}"
+        if uid in seen:
+            continue
+        seen.add(uid)
+        merged.append(r)
+
+    return merged
 
 
 # =========================
@@ -418,14 +483,12 @@ def read_config(ss) -> ParserConfig:
 
     kv = {}
 
-    # key/value format
     if len(values[0]) >= 2 and values[0][0].strip().lower() in {"key", "start_utc"}:
         if values[0][0].strip().lower() == "key":
             for row in values[1:]:
                 if len(row) >= 2 and row[0].strip():
                     kv[row[0].strip().lower()] = row[1].strip()
         else:
-            # table format
             headers = [h.strip().lower() for h in values[0]]
             first = values[1] if len(values) > 1 else []
             kv = {headers[i]: first[i].strip() if i < len(first) else "" for i in range(len(headers))}
@@ -497,26 +560,55 @@ def read_wallets(ss) -> list[Wallet]:
 # NORMALIZATION + CLASSIFICATION
 # =========================
 
-def normalize_row(row: dict[str, Any], wallet: Wallet) -> Event:
-    token_addr = norm_addr(row.get("contractAddress", ""))
-    symbol = str(row.get("tokenSymbol", "")).upper()
-    amount = amount_from_raw(row.get("value", "0"), row.get("tokenDecimal", "0"))
+def normalize_alchemy_row(row: dict[str, Any], wallet: Wallet, cfg: ParserConfig) -> Event | None:
+    """
+    Convert Alchemy transfer object → Event.
+    Filters by period [cfg.start_ts, cfg.end_ts] and tracked tokens.
+    Returns None if row should be skipped.
+    """
+    raw_contract = row.get("rawContract") or {}
+    contract = norm_addr(raw_contract.get("address", ""))
+
+    # Only tracked tokens
+    if contract not in {cfg.token_main_address, cfg.token_quote_address}:
+        return None
+
+    # Time filter
+    metadata = row.get("metadata") or {}
+    block_ts_iso = metadata.get("blockTimestamp", "")
+    ts = parse_iso_to_ts(block_ts_iso)
+    if ts == 0:
+        return None
+    if ts < cfg.start_ts or ts > cfg.end_ts:
+        return None
 
     from_addr = norm_addr(row.get("from", ""))
     to_addr = norm_addr(row.get("to", ""))
     direction = direction_for_wallet(wallet.address, from_addr, to_addr)
+    if direction == "OTHER":
+        return None
+
+    symbol = str(row.get("asset") or "").upper()
+    if not symbol:
+        # Fallback by contract address mapping
+        if contract == cfg.token_main_address:
+            symbol = cfg.token_main_symbol
+        elif contract == cfg.token_quote_address:
+            symbol = cfg.token_quote_symbol
+
+    amount = amount_from_raw_hex(
+        raw_contract.get("value", "0x0"),
+        raw_contract.get("decimal", "0x0"),
+    )
 
     if direction == "IN":
         counterparty = from_addr
-    elif direction == "OUT":
-        counterparty = to_addr
     else:
-        counterparty = ""
+        counterparty = to_addr
 
-    ts = int(row.get("timeStamp", "0"))
     tx_hash = str(row.get("hash", "")).lower()
 
-    return Event(
+    e = Event(
         datetime_utc=ts_to_utc_str(ts),
         ts=ts,
         wallet_label=wallet.label,
@@ -532,6 +624,18 @@ def normalize_row(row: dict[str, Any], wallet: Wallet) -> Event:
         protocol="",
         link=f"{BASESCAN_TX_URL}{tx_hash}",
     )
+    e.contract_address = contract  # internal field for classifier
+    return e
+
+
+def filter_and_normalize_rows(raw_rows: Iterable[dict], wallet: Wallet, cfg: ParserConfig) -> list[Event]:
+    out: list[Event] = []
+    for row in raw_rows:
+        e = normalize_alchemy_row(row, wallet, cfg)
+        if e is not None:
+            out.append(e)
+    out.sort(key=lambda e: (e.ts, e.tx_hash))
+    return out
 
 
 def classify_wallet_events(wallet: Wallet, events: list[Event], cfg: ParserConfig) -> WalletStats:
@@ -554,8 +658,6 @@ def classify_wallet_events(wallet: Wallet, events: list[Event], cfg: ParserConfi
         quote_in = Decimal(0)
         quote_out = Decimal(0)
 
-        # Event does not store contract in the visible output fields.
-        # We attach contract_address dynamically while normalizing rows.
         for e in legs:
             contract = getattr(e, "contract_address", "")
             if contract == cfg.token_main_address:
@@ -633,24 +735,6 @@ def classify_wallet_events(wallet: Wallet, events: list[Event], cfg: ParserConfi
                         stats.quote_sent_transfer += e.amount
 
     return stats
-
-
-def filter_and_normalize_rows(raw_rows: Iterable[dict], wallet: Wallet, cfg: ParserConfig) -> list[Event]:
-    wanted = {cfg.token_main_address, cfg.token_quote_address}
-    out = []
-
-    for row in raw_rows:
-        contract = norm_addr(row.get("contractAddress", ""))
-        if contract not in wanted:
-            continue
-
-        e = normalize_row(row, wallet)
-        e.contract_address = contract  # dynamic internal field, not written to sheet
-        if e.direction in {"IN", "OUT"}:
-            out.append(e)
-
-    out.sort(key=lambda e: (e.ts, e.tx_hash))
-    return out
 
 
 # =========================
@@ -780,22 +864,20 @@ def main():
              cfg.token_main_symbol, cfg.token_main_address,
              cfg.token_quote_symbol, cfg.token_quote_address)
 
-    start_block = get_block_by_timestamp(cfg.start_ts, closest="after")
-    end_block = get_block_by_timestamp(cfg.end_ts, closest="before")
-
-    log.info("Block range: %s → %s", start_block, end_block)
-
+    contract_addresses = [cfg.token_main_address, cfg.token_quote_address]
     stats_list = []
 
     for wallet in wallets:
         log.info("Fetching wallet=%s label=%s", wallet.address, wallet.label)
-        raw_rows = list(iter_token_transfers(wallet.address, start_block, end_block))
+        raw_rows = fetch_wallet_transfers(wallet.address, contract_addresses)
+        log.info("  raw transfers fetched: %s", len(raw_rows))
+
         events = filter_and_normalize_rows(raw_rows, wallet, cfg)
         stats = classify_wallet_events(wallet, events, cfg)
         stats_list.append(stats)
 
         log.info(
-            "%s: target_events=%s transfers=%s swaps=%s pnl=%s",
+            "%s: in_period_events=%s transfers=%s swaps=%s pnl=%s",
             wallet.label,
             len(events),
             len(stats.transfer_events),
