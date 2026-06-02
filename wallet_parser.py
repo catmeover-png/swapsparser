@@ -42,7 +42,8 @@ from typing import Any, Iterable
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
-
+import gspread
+from gspread.exceptions import APIError
 
 getcontext().prec = 50
 
@@ -560,12 +561,50 @@ def ensure_ws(ss, title: str, rows: int = 1000, cols: int = 30):
         return ss.add_worksheet(title=title, rows=rows, cols=cols)
 
 
-def clear_and_write(ws, rows: list[list[Any]]):
+def clear_and_write(ws, rows: list[list[Any]], chunk_size: int = 300):
+    """
+    Clears worksheet and writes data in chunks with retries.
+    Fixes Google Sheets API 500 errors caused by large single updates.
+    """
     ws.clear()
 
-    if rows:
-        ws.update(values=rows, range_name="A1", value_input_option="USER_ENTERED")
+    if not rows:
+        return
 
+    total_rows = len(rows)
+
+    for start in range(0, total_rows, chunk_size):
+        chunk = rows[start:start + chunk_size]
+        range_name = f"A{start + 1}"
+
+        for attempt in range(5):
+            try:
+                ws.update(
+                    values=chunk,
+                    range_name=range_name,
+                    value_input_option="USER_ENTERED",
+                )
+                break
+
+            except APIError as e:
+                msg = str(e)
+
+                if attempt == 4:
+                    raise
+
+                sleep_for = 2 ** attempt
+
+                log.warning(
+                    "Google Sheets update failed at rows %s-%s: %s. Retry in %ss",
+                    start + 1,
+                    start + len(chunk),
+                    msg,
+                    sleep_for,
+                )
+
+                time.sleep(sleep_for)
+
+        time.sleep(0.3)
 
 def read_config(ss) -> ParserConfig:
     ws = ss.worksheet("Config")
