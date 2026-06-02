@@ -561,7 +561,7 @@ def ensure_ws(ss, title: str, rows: int = 1000, cols: int = 30):
         return ss.add_worksheet(title=title, rows=rows, cols=cols)
 
 
-def clear_and_write(ws, rows: list[list[Any]], chunk_size: int = 300):
+def clear_and_write(ws, rows: list[list[Any]], chunk_size: int = 2000):
     ws.clear()
 
     if not rows:
