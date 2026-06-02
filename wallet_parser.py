@@ -562,10 +562,6 @@ def ensure_ws(ss, title: str, rows: int = 1000, cols: int = 30):
 
 
 def clear_and_write(ws, rows: list[list[Any]], chunk_size: int = 300):
-    """
-    Clears worksheet and writes data in chunks with retries.
-    Fixes Google Sheets API 500 errors caused by large single updates.
-    """
     ws.clear()
 
     if not rows:
@@ -588,6 +584,9 @@ def clear_and_write(ws, rows: list[list[Any]], chunk_size: int = 300):
 
             except APIError as e:
                 msg = str(e)
+
+                if "[400]" in msg and "exceeds grid limits" in msg:
+                    raise
 
                 if attempt == 4:
                     raise
@@ -902,12 +901,24 @@ def classify_wallet_events(
 # =========================
 
 def replace_sheet(ss, title: str, header: list[str], data_rows: list[list[Any]]):
+    needed_rows = max(len(data_rows) + 1, 100)
+    needed_cols = max(len(header), 20)
+
     ws = ensure_ws(
         ss,
         title,
-        rows=max(len(data_rows) + 10, 100),
-        cols=max(len(header) + 2, 20),
+        rows=needed_rows,
+        cols=needed_cols,
     )
+
+    current_rows = ws.row_count
+    current_cols = ws.col_count
+
+    if current_rows < needed_rows or current_cols < needed_cols:
+        ws.resize(
+            rows=max(current_rows, needed_rows),
+            cols=max(current_cols, needed_cols),
+        )
 
     matrix = [header] + data_rows
     clear_and_write(ws, matrix)
