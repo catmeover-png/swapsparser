@@ -10,6 +10,8 @@ Reads:
            * wallet_address can be an address, a label from Wallets,
              or "*" / "all" / empty = apply this period to every wallet.
            * period_label is optional (default P1, P2, ... per wallet).
+           * trader is optional: rows with the same trader get one TOTAL row
+             in Final (empty = all wallets/periods together).
            * If Periods has at least one row, ONLY wallets mentioned there
              are processed. If Periods is empty → old behaviour
              (Config period for every wallet from Wallets).
@@ -19,7 +21,9 @@ Writes:
 - Raw_Transactions
 - Transfers
 - Swaps
-- Final      (one row per wallet × period)
+- Final      (one row per wallet × period, then TOTAL row(s) per trader:
+              all swaps of all wallets/periods in time order, realized PnL
+              by average cost, remaining position and breakeven price)
 
 API:
 - Alchemy JSON-RPC on Base mainnet
@@ -88,7 +92,7 @@ DEFAULT_LMTS_ADDRESS = "0x9eadbe35f3ee3bf3e28180070c429298a1b02f93"
 DEFAULT_USDC_ADDRESS = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 
 PERIODS_SHEET = "Periods"
-PERIODS_HEADER = ["wallet_address", "start_utc", "end_utc", "period_label"]
+PERIODS_HEADER = ["wallet_address", "start_utc", "end_utc", "period_label", "trader"]
 ALL_WALLETS_MARKERS = {"", "*", "all"}
 
 
@@ -114,6 +118,7 @@ class Period:
     label: str
     start_ts: int
     end_ts: int
+    trader: str = ""
 
     @property
     def start_utc(self) -> str:
@@ -164,6 +169,7 @@ class WalletStats:
     period_start_utc: str
     period_end_utc: str
     period_label: str = ""
+    trader: str = ""
 
     total_main_bought: Decimal = Decimal(0)
     total_quote_spent: Decimal = Decimal(0)
@@ -864,7 +870,8 @@ def read_periods(ss) -> list[tuple[str, Period]]:
             raise RuntimeError(f"{PERIODS_SHEET} row {row_num}: end_utc is before start_utc")
 
         label = str(cell(row, "period_label")).strip()
-        out.append((wallet_key, Period(label=label, start_ts=start_ts, end_ts=end_ts)))
+        trader = str(cell(row, "trader")).strip()
+        out.append((wallet_key, Period(label=label, start_ts=start_ts, end_ts=end_ts, trader=trader)))
 
     return out
 
@@ -1043,6 +1050,7 @@ def classify_wallet_events(
         period_start_utc=period.start_utc,
         period_end_utc=period.end_utc,
         period_label=period.label,
+        trader=period.trader,
     )
 
     by_tx: dict[str, list[Event]] = {}
@@ -1142,6 +1150,137 @@ def classify_wallet_events(
                         stats.quote_sent_transfer += event.amount
 
     return stats
+
+
+# =========================
+# TRADER TOTAL (chronological, average cost)
+# =========================
+
+@dataclass
+class TraderSummary:
+    trader: str
+    period_start_utc: str
+    period_end_utc: str
+    swaps_count: int = 0
+
+    total_main_bought: Decimal = Decimal(0)
+    total_quote_spent: Decimal = Decimal(0)
+    total_main_sold: Decimal = Decimal(0)
+    total_quote_received: Decimal = Decimal(0)
+
+    matched_main_sold: Decimal = Decimal(0)     # sold from inventory bought inside the periods
+    unmatched_main_sold: Decimal = Decimal(0)   # sold without a known buy before it (no cost basis)
+    realized_pnl_quote: Decimal = Decimal(0)
+
+    remaining_main: Decimal = Decimal(0)
+    remaining_cost_quote: Decimal = Decimal(0)
+
+    main_received_transfer: Decimal = Decimal(0)
+    main_sent_transfer: Decimal = Decimal(0)
+    quote_received_transfer: Decimal = Decimal(0)
+    quote_sent_transfer: Decimal = Decimal(0)
+
+    @property
+    def avg_buy_price(self) -> Decimal:
+        return self.total_quote_spent / self.total_main_bought if self.total_main_bought else Decimal(0)
+
+    @property
+    def avg_sell_price(self) -> Decimal:
+        return self.total_quote_received / self.total_main_sold if self.total_main_sold else Decimal(0)
+
+    @property
+    def remaining_avg_cost(self) -> Decimal:
+        return self.remaining_cost_quote / self.remaining_main if self.remaining_main else Decimal(0)
+
+    @property
+    def net_quote_cashflow(self) -> Decimal:
+        return self.total_quote_received - self.total_quote_spent
+
+    @property
+    def net_main_from_swaps(self) -> Decimal:
+        return self.total_main_bought - self.total_main_sold
+
+    @property
+    def breakeven_price(self) -> Decimal:
+        # price at which the remaining LMTS pays back the net USDC spent
+        if self.net_main_from_swaps > 0 and self.net_quote_cashflow < 0:
+            return -self.net_quote_cashflow / self.net_main_from_swaps
+        return Decimal(0)
+
+
+def build_trader_summaries(stats_list: list[WalletStats], cfg: ParserConfig) -> list[TraderSummary]:
+    groups: dict[str, list[WalletStats]] = {}
+    for stats in stats_list:
+        groups.setdefault(stats.trader, []).append(stats)
+
+    summaries: list[TraderSummary] = []
+
+    for trader, group in groups.items():
+        # the same swap can be in two overlapping periods of one wallet — count once
+        swaps: dict[tuple[str, str], Event] = {}
+        transfers: dict[tuple, Event] = {}
+
+        for stats in group:
+            for e in stats.swap_events:
+                swaps[(e.wallet_address, e.tx_hash)] = e
+            for e in stats.transfer_events:
+                key = (e.wallet_address, e.tx_hash, e.contract_address, e.direction,
+                       e.counterparty, e.amount)
+                transfers[key] = e
+
+        summary = TraderSummary(
+            trader=trader,
+            period_start_utc=min(s.period_start_utc for s in group),
+            period_end_utc=max(s.period_end_utc for s in group),
+            swaps_count=len(swaps),
+        )
+
+        inventory = Decimal(0)
+        cost = Decimal(0)
+
+        for e in sorted(swaps.values(), key=lambda x: (x.ts, x.tx_hash, x.wallet_address)):
+            qty = e.main_amount or Decimal(0)
+            quote = e.quote_amount or Decimal(0)
+
+            if e.side == "BUY":
+                summary.total_main_bought += qty
+                summary.total_quote_spent += quote
+                inventory += qty
+                cost += quote
+                continue
+
+            summary.total_main_sold += qty
+            summary.total_quote_received += quote
+
+            covered = min(qty, inventory)
+            if covered > 0:
+                avg_cost = cost / inventory
+                proceeds = quote * covered / qty
+                summary.realized_pnl_quote += proceeds - covered * avg_cost
+                summary.matched_main_sold += covered
+                cost -= covered * avg_cost
+                inventory -= covered
+
+            summary.unmatched_main_sold += qty - covered
+
+        summary.remaining_main = inventory
+        summary.remaining_cost_quote = cost
+
+        for e in transfers.values():
+            if e.contract_address == cfg.token_main_address:
+                if e.direction == "IN":
+                    summary.main_received_transfer += e.amount
+                elif e.direction == "OUT":
+                    summary.main_sent_transfer += e.amount
+            elif e.contract_address == cfg.token_quote_address:
+                if e.direction == "IN":
+                    summary.quote_received_transfer += e.amount
+                elif e.direction == "OUT":
+                    summary.quote_sent_transfer += e.amount
+
+        summaries.append(summary)
+
+    return summaries
 
 
 # =========================
@@ -1265,6 +1404,13 @@ def write_outputs(ss, stats_list: list[WalletStats], cfg: ParserConfig):
         f"net_{quote}_transfer",
         "period_label",
         "swaps_count",
+        # filled only in TOTAL rows
+        f"unmatched_{main}_sold",
+        f"remaining_{main}",
+        f"remaining_cost_{quote}",
+        "remaining_avg_cost",
+        f"net_{quote}_cashflow",
+        "breakeven_price",
     ]
 
     final_rows = []
@@ -1289,6 +1435,46 @@ def write_outputs(ss, stats_list: list[WalletStats], cfg: ParserConfig):
             stats.period_label,
             len(stats.swap_events),
         ])
+
+    summaries = build_trader_summaries(stats_list, cfg)
+    if summaries:
+        final_rows.append([])
+
+    for t in summaries:
+        final_rows.append([
+            f"TOTAL — {t.trader}" if t.trader else "TOTAL",
+            "",
+            t.period_start_utc,
+            t.period_end_utc,
+            dec_to_str(t.total_main_bought),
+            dec_to_str(t.total_quote_spent),
+            dec_to_str(t.avg_buy_price),
+            dec_to_str(t.total_main_sold),
+            dec_to_str(t.total_quote_received),
+            dec_to_str(t.avg_sell_price),
+            dec_to_str(t.matched_main_sold),
+            dec_to_str(t.realized_pnl_quote),
+            dec_to_str(t.main_received_transfer),
+            dec_to_str(t.main_sent_transfer),
+            dec_to_str(t.main_received_transfer - t.main_sent_transfer),
+            dec_to_str(t.quote_received_transfer),
+            dec_to_str(t.quote_sent_transfer),
+            dec_to_str(t.quote_received_transfer - t.quote_sent_transfer),
+            "all periods, time order, avg cost",
+            t.swaps_count,
+            dec_to_str(t.unmatched_main_sold),
+            dec_to_str(t.remaining_main),
+            dec_to_str(t.remaining_cost_quote),
+            dec_to_str(t.remaining_avg_cost),
+            dec_to_str(t.net_quote_cashflow),
+            dec_to_str(t.breakeven_price),
+        ])
+
+        log.info(
+            "TOTAL %s: realized_pnl=%s remaining=%s breakeven=%s unmatched_sold=%s",
+            t.trader or "(all)", dec_to_str(t.realized_pnl_quote), dec_to_str(t.remaining_main),
+            dec_to_str(t.breakeven_price), dec_to_str(t.unmatched_main_sold),
+        )
 
     replace_sheet(ss, "Final", final_header, final_rows)
 
