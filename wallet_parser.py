@@ -3,14 +3,23 @@
 Single-file Base wallet analytics parser → Google Sheets.
 
 Reads:
-- Config
-- Wallets
+- Config   (tokens; start_utc / end_utc = default period when Periods is empty)
+- Wallets  (wallet_address | label)
+- Periods  (optional, multiple periods per wallet):
+             wallet_address | start_utc | end_utc | period_label
+           * wallet_address can be an address, a label from Wallets,
+             or "*" / "all" / empty = apply this period to every wallet.
+           * period_label is optional (default P1, P2, ... per wallet).
+           * If Periods has at least one row, ONLY wallets mentioned there
+             are processed. If Periods is empty → old behaviour
+             (Config period for every wallet from Wallets).
+           * Both ends are inclusive, to the second, UTC.
 
 Writes:
 - Raw_Transactions
 - Transfers
 - Swaps
-- Final
+- Final      (one row per wallet × period)
 
 API:
 - Alchemy JSON-RPC on Base mainnet
@@ -26,23 +35,23 @@ Optional env vars:
 - LMTS_ADDRESS
 - USDC_ADDRESS
 - RATE_LIMIT_RPS
-- ALCHEMY_BASE_URL  (default: https://base-mainnet.g.alchemy.com/v2)
+- ALCHEMY_BASE_URL         (default: https://base-mainnet.g.alchemy.com/v2)
+- PERIOD_MERGE_GAP_HOURS   (default: 24) — periods of one wallet closer than this
+                            are fetched from Alchemy in one request window
 """
 
 import os
 import json
 import time
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import Decimal, getcontext
-from collections import defaultdict
 from typing import Any, Iterable
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
-import gspread
 from gspread.exceptions import APIError
 
 getcontext().prec = 50
@@ -65,6 +74,7 @@ ALCHEMY_BASE_URL = os.getenv(
 ).strip()
 
 RATE_LIMIT_RPS = int(os.getenv("RATE_LIMIT_RPS", "4"))
+PERIOD_MERGE_GAP_SEC = int(float(os.getenv("PERIOD_MERGE_GAP_HOURS", "24")) * 3600)
 
 GOOGLE_SHEET_ID = (
     os.getenv("GOOGLE_SHEET_ID", "").strip()
@@ -77,6 +87,10 @@ BASESCAN_TX_URL = "https://basescan.org/tx/"
 DEFAULT_LMTS_ADDRESS = "0x9eadbe35f3ee3bf3e28180070c429298a1b02f93"
 DEFAULT_USDC_ADDRESS = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 
+PERIODS_SHEET = "Periods"
+PERIODS_HEADER = ["wallet_address", "start_utc", "end_utc", "period_label"]
+ALL_WALLETS_MARKERS = {"", "*", "all"}
+
 
 # =========================
 # DATA MODELS
@@ -86,8 +100,8 @@ DEFAULT_USDC_ADDRESS = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 class ParserConfig:
     start_utc: str
     end_utc: str
-    start_ts: int
-    end_ts: int
+    start_ts: int | None
+    end_ts: int | None
     chain: str
     token_main_symbol: str
     token_main_address: str
@@ -96,9 +110,25 @@ class ParserConfig:
 
 
 @dataclass
+class Period:
+    label: str
+    start_ts: int
+    end_ts: int
+
+    @property
+    def start_utc(self) -> str:
+        return ts_to_utc_str(self.start_ts)
+
+    @property
+    def end_utc(self) -> str:
+        return ts_to_utc_str(self.end_ts)
+
+
+@dataclass
 class Wallet:
     address: str
     label: str
+    periods: list[Period] = field(default_factory=list)
 
 
 @dataclass
@@ -121,6 +151,10 @@ class Event:
     main_amount: Decimal | None = None
     quote_amount: Decimal | None = None
     price: Decimal | None = None
+    contract_address: str = ""
+    period_label: str = ""
+    period_start_utc: str = ""
+    period_end_utc: str = ""
 
 
 @dataclass
@@ -129,6 +163,7 @@ class WalletStats:
     wallet_address: str
     period_start_utc: str
     period_end_utc: str
+    period_label: str = ""
 
     total_main_bought: Decimal = Decimal(0)
     total_quote_spent: Decimal = Decimal(0)
@@ -173,17 +208,42 @@ class WalletStats:
 # BASIC HELPERS
 # =========================
 
-def norm_addr(addr: str) -> str:
+DATETIME_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%dT%H:%M",
+    "%Y-%m-%d",
+    "%d.%m.%Y %H:%M:%S",
+    "%d.%m.%Y %H:%M",
+    "%d.%m.%Y",
+)
+
+# Google Sheets serial date: days since 1899-12-30; 25569 = 1970-01-01
+SHEETS_UNIX_EPOCH_SERIAL = 25569
+
+
+def norm_addr(addr: Any) -> str:
     return str(addr or "").strip().lower()
 
 
-def parse_utc_to_ts(value: str) -> int:
-    value = str(value).strip()
-    formats = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d")
+def parse_utc_to_ts(value: Any) -> int:
+    """Accepts 'YYYY-MM-DD HH:MM:SS' (and a few variants) or a Sheets serial date number."""
+    if isinstance(value, bool):
+        raise ValueError(f"Cannot parse UTC datetime: {value!r}")
 
-    for fmt in formats:
+    if isinstance(value, (int, float)):
+        return int(round((float(value) - SHEETS_UNIX_EPOCH_SERIAL) * 86400))
+
+    s = str(value).strip()
+    if s.upper().endswith(" UTC"):
+        s = s[:-4].strip()
+    if s.endswith("Z"):
+        s = s[:-1]
+
+    for fmt in DATETIME_FORMATS:
         try:
-            return int(datetime.strptime(value, fmt).replace(tzinfo=timezone.utc).timestamp())
+            return int(datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).timestamp())
         except ValueError:
             pass
 
@@ -357,51 +417,84 @@ def alchemy_rpc(method: str, params: list[Any], max_retries: int = 5) -> Any:
 
 
 # =========================
-# DATE → BLOCK RANGE
+# DATE → BLOCK (cached, interpolation search)
 # =========================
 
+_latest_block: int | None = None
+_block_ts_cache: dict[int, int] = {}
+_block_search_cache: dict[tuple[int, str], int] = {}
+
+
 def get_latest_block_number() -> int:
-    result = alchemy_rpc("eth_blockNumber", [])
-    return hex_to_int(result)
+    global _latest_block
+    if _latest_block is None:
+        _latest_block = hex_to_int(alchemy_rpc("eth_blockNumber", []))
+    return _latest_block
 
 
 def get_block_timestamp(block_number: int) -> int:
+    if block_number in _block_ts_cache:
+        return _block_ts_cache[block_number]
+
     result = alchemy_rpc("eth_getBlockByNumber", [int_to_hex_block(block_number), False])
-
     if not result:
-        return 0
+        raise RuntimeError(f"Block {block_number} not found")
 
-    return hex_to_int(result.get("timestamp", "0x0"))
+    ts = hex_to_int(result.get("timestamp", "0x0"))
+    _block_ts_cache[block_number] = ts
+    return ts
 
 
 def find_block_by_timestamp(target_ts: int, closest: str = "before") -> int:
+    """
+    closest="before" → last block with timestamp <= target_ts
+    closest="after"  → first block with timestamp >= target_ts
+    Base has fixed 2s blocks, so interpolation usually hits in 1–3 RPC calls.
+    """
     if closest not in {"before", "after"}:
         raise ValueError("closest must be 'before' or 'after'")
 
-    low = 0
-    high = get_latest_block_number()
+    key = (int(target_ts), closest)
+    if key in _block_search_cache:
+        return _block_search_cache[key]
 
-    candidate_after = high
-    candidate_before = 0
+    lo, hi = 0, get_latest_block_number()
+    lo_ts, hi_ts = get_block_timestamp(lo), get_block_timestamp(hi)
 
-    while low <= high:
-        mid = (low + high) // 2
-        mid_ts = get_block_timestamp(mid)
+    if target_ts <= lo_ts:
+        result = lo
+    elif target_ts >= hi_ts:
+        result = hi
+    else:
+        # invariant: lo_ts < target_ts < hi_ts
+        result = None
+        steps = 0
 
-        if mid_ts == 0:
-            high = mid - 1
-            continue
+        while hi - lo > 1:
+            steps += 1
 
-        if mid_ts < target_ts:
-            candidate_before = mid
-            low = mid + 1
-        elif mid_ts > target_ts:
-            candidate_after = mid
-            high = mid - 1
-        else:
-            return mid
+            if steps <= 8 and hi_ts > lo_ts:
+                guess = lo + (target_ts - lo_ts) * (hi - lo) // (hi_ts - lo_ts)
+            else:
+                guess = (lo + hi) // 2
 
-    return candidate_after if closest == "after" else candidate_before
+            guess = min(max(guess, lo + 1), hi - 1)
+            guess_ts = get_block_timestamp(guess)
+
+            if guess_ts == target_ts:
+                result = guess
+                break
+
+            if guess_ts < target_ts:
+                lo, lo_ts = guess, guess_ts
+            else:
+                hi, hi_ts = guess, guess_ts
+
+        if result is None:
+            result = hi if closest == "after" else lo
+
+    _block_search_cache[key] = result
+    return result
 
 
 # =========================
@@ -487,6 +580,28 @@ def fetch_all_transfers_one_direction(
     return rows
 
 
+def transfer_unique_id(row: dict) -> str:
+    return row.get("uniqueId") or (
+        f"{row.get('hash')}:{row.get('from')}:{row.get('to')}:"
+        f"{(row.get('rawContract') or {}).get('address')}:"
+        f"{(row.get('rawContract') or {}).get('value')}"
+    )
+
+
+def dedupe_transfers(rows: Iterable[dict]) -> list[dict]:
+    seen: set[str] = set()
+    merged: list[dict] = []
+
+    for row in rows:
+        unique_id = transfer_unique_id(row)
+        if unique_id in seen:
+            continue
+        seen.add(unique_id)
+        merged.append(row)
+
+    return merged
+
+
 def fetch_wallet_transfers(
     wallet: str,
     contract_addresses: list[str],
@@ -509,23 +624,21 @@ def fetch_wallet_transfers(
         to_block=to_block,
     )
 
-    seen: set[str] = set()
-    merged: list[dict] = []
+    return dedupe_transfers(out_rows + in_rows)
 
-    for row in out_rows + in_rows:
-        unique_id = row.get("uniqueId") or (
-            f"{row.get('hash')}:{row.get('from')}:{row.get('to')}:"
-            f"{row.get('rawContract', {}).get('address')}:"
-            f"{row.get('rawContract', {}).get('value')}"
-        )
 
-        if unique_id in seen:
-            continue
+def merge_fetch_windows(periods: list[Period], gap_sec: int) -> list[tuple[int, int]]:
+    """Merge overlapping / close periods so we don't fetch the same blocks many times."""
+    spans = sorted((p.start_ts, p.end_ts) for p in periods)
+    merged: list[list[int]] = []
 
-        seen.add(unique_id)
-        merged.append(row)
+    for start, end in spans:
+        if merged and start <= merged[-1][1] + gap_sec:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
 
-    return merged
+    return [(s, e) for s, e in merged]
 
 
 # =========================
@@ -605,6 +718,7 @@ def clear_and_write(ws, rows: list[list[Any]], chunk_size: int = 2000):
 
         time.sleep(0.3)
 
+
 def read_config(ss) -> ParserConfig:
     ws = ss.worksheet("Config")
     values = ws.get_all_values()
@@ -632,9 +746,6 @@ def read_config(ss) -> ParserConfig:
 
     start_utc = kv.get("start_utc", "")
     end_utc = kv.get("end_utc", "")
-
-    if not start_utc or not end_utc:
-        raise RuntimeError("Config must contain start_utc and end_utc")
 
     chain = kv.get("chain", "Base") or "Base"
 
@@ -665,8 +776,8 @@ def read_config(ss) -> ParserConfig:
     return ParserConfig(
         start_utc=start_utc,
         end_utc=end_utc,
-        start_ts=parse_utc_to_ts(start_utc),
-        end_ts=parse_utc_to_ts(end_utc),
+        start_ts=parse_utc_to_ts(start_utc) if start_utc else None,
+        end_ts=parse_utc_to_ts(end_utc) if end_utc else None,
         chain=chain,
         token_main_symbol=token_main_symbol,
         token_main_address=token_main_address,
@@ -680,18 +791,149 @@ def read_wallets(ss) -> list[Wallet]:
     records = ws.get_all_records()
 
     wallets: list[Wallet] = []
+    seen: set[str] = set()
 
     for row in records:
         address = norm_addr(row.get("wallet_address", ""))
         label = str(row.get("label", "")).strip()
 
-        if address:
+        if address and address not in seen:
+            seen.add(address)
             wallets.append(Wallet(address=address, label=label or address[:10]))
 
-    if not wallets:
-        raise RuntimeError("Wallets sheet has no wallet_address rows")
-
     return wallets
+
+
+def read_periods(ss) -> list[tuple[str, Period]]:
+    """
+    Returns list of (wallet_key, Period). wallet_key is a lowercased address,
+    label, or one of ALL_WALLETS_MARKERS. Creates an empty Periods sheet if missing.
+    """
+    try:
+        ws = ss.worksheet(PERIODS_SHEET)
+    except gspread.WorksheetNotFound:
+        ws = ss.add_worksheet(title=PERIODS_SHEET, rows=200, cols=len(PERIODS_HEADER))
+        ws.update(values=[PERIODS_HEADER], range_name="A1")
+        log.info("Created empty %s sheet (header only) — using Config period", PERIODS_SHEET)
+        return []
+
+    # UNFORMATTED → date cells come back as serial numbers, independent of sheet locale
+    values = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
+
+    if not values:
+        return []
+
+    headers = [str(h).strip().lower() for h in values[0]]
+    idx = {h: i for i, h in enumerate(headers) if h}
+
+    if "start_utc" not in idx or "end_utc" not in idx:
+        raise RuntimeError(
+            f"{PERIODS_SHEET} sheet must have header: {' | '.join(PERIODS_HEADER)}"
+        )
+
+    wallet_col = "wallet_address" if "wallet_address" in idx else ("wallet" if "wallet" in idx else None)
+
+    def cell(row: list[Any], name: str | None) -> Any:
+        if name is None:
+            return ""
+        i = idx.get(name)
+        if i is None or i >= len(row):
+            return ""
+        return row[i]
+
+    out: list[tuple[str, Period]] = []
+
+    for row_num, row in enumerate(values[1:], start=2):
+        if all(str(c).strip() == "" for c in row):
+            continue
+
+        wallet_key = norm_addr(cell(row, wallet_col))
+        start_raw = cell(row, "start_utc")
+        end_raw = cell(row, "end_utc")
+
+        if str(start_raw).strip() == "" or str(end_raw).strip() == "":
+            raise RuntimeError(f"{PERIODS_SHEET} row {row_num}: start_utc and end_utc are required")
+
+        try:
+            start_ts = parse_utc_to_ts(start_raw)
+            end_ts = parse_utc_to_ts(end_raw)
+        except ValueError as e:
+            raise RuntimeError(f"{PERIODS_SHEET} row {row_num}: {e}") from e
+
+        if end_ts < start_ts:
+            raise RuntimeError(f"{PERIODS_SHEET} row {row_num}: end_utc is before start_utc")
+
+        label = str(cell(row, "period_label")).strip()
+        out.append((wallet_key, Period(label=label, start_ts=start_ts, end_ts=end_ts)))
+
+    return out
+
+
+def build_wallet_periods(
+    wallets: list[Wallet],
+    period_rows: list[tuple[str, Period]],
+    cfg: ParserConfig,
+) -> list[Wallet]:
+    """Attach periods to wallets. Returns only wallets that have at least one period."""
+
+    if not period_rows:
+        if cfg.start_ts is None or cfg.end_ts is None:
+            raise RuntimeError("Periods sheet is empty and Config has no start_utc / end_utc")
+        if cfg.end_ts < cfg.start_ts:
+            raise RuntimeError("end_utc must be greater than or equal to start_utc")
+        if not wallets:
+            raise RuntimeError("Wallets sheet has no wallet_address rows")
+
+        for w in wallets:
+            w.periods = [Period(label="Config", start_ts=cfg.start_ts, end_ts=cfg.end_ts)]
+        return wallets
+
+    by_addr = {w.address: w for w in wallets}
+    by_label = {w.label.lower(): w for w in wallets}
+
+    # pass 1: resolve explicit wallets (adding unknown addresses)
+    for key, _ in period_rows:
+        if key in ALL_WALLETS_MARKERS or key in by_addr or key in by_label:
+            continue
+
+        if key.startswith("0x") and len(key) == 42:
+            w = Wallet(address=key, label=key[:10])
+            wallets.append(w)
+            by_addr[key] = w
+            log.warning("Wallet %s from %s is not in Wallets — using label %s", key, PERIODS_SHEET, w.label)
+        else:
+            raise RuntimeError(
+                f"{PERIODS_SHEET}: unknown wallet {key!r} (not an address and not a label from Wallets)"
+            )
+
+    # pass 2: attach periods
+    for key, period in period_rows:
+        if key in ALL_WALLETS_MARKERS:
+            targets = wallets
+        else:
+            targets = [by_addr.get(key) or by_label[key]]
+
+        for w in targets:
+            w.periods.append(replace(period))
+
+    active: list[Wallet] = []
+
+    for w in wallets:
+        if not w.periods:
+            log.info("Wallet %s (%s) has no periods in %s — skipped", w.label, w.address, PERIODS_SHEET)
+            continue
+
+        w.periods.sort(key=lambda p: (p.start_ts, p.end_ts))
+        for i, p in enumerate(w.periods, start=1):
+            if not p.label:
+                p.label = f"P{i}"
+
+        active.append(w)
+
+    if not active:
+        raise RuntimeError("No wallets with periods to process")
+
+    return active
 
 
 # =========================
@@ -710,13 +952,9 @@ def normalize_alchemy_row(
         return None
 
     metadata = row.get("metadata") or {}
-    block_ts_iso = metadata.get("blockTimestamp", "")
-    ts = parse_iso_to_ts(block_ts_iso)
+    ts = parse_iso_to_ts(metadata.get("blockTimestamp", ""))
 
     if ts == 0:
-        return None
-
-    if ts < cfg.start_ts or ts > cfg.end_ts:
         return None
 
     from_addr = norm_addr(row.get("from", ""))
@@ -743,7 +981,7 @@ def normalize_alchemy_row(
     counterparty = from_addr if direction == "IN" else to_addr
     tx_hash = str(row.get("hash", "")).lower()
 
-    event = Event(
+    return Event(
         datetime_utc=ts_to_utc_str(ts),
         ts=ts,
         wallet_label=wallet.label,
@@ -758,10 +996,8 @@ def normalize_alchemy_row(
         counterparty=counterparty,
         protocol="",
         link=f"{BASESCAN_TX_URL}{tx_hash}",
+        contract_address=contract,
     )
-
-    event.contract_address = contract
-    return event
 
 
 def filter_and_normalize_rows(
@@ -781,26 +1017,42 @@ def filter_and_normalize_rows(
     return events
 
 
+def events_for_period(events: list[Event], period: Period) -> list[Event]:
+    """Copies of events inside [start, end] (inclusive), tagged with the period."""
+    return [
+        replace(
+            e,
+            period_label=period.label,
+            period_start_utc=period.start_utc,
+            period_end_utc=period.end_utc,
+        )
+        for e in events
+        if period.start_ts <= e.ts <= period.end_ts
+    ]
+
+
 def classify_wallet_events(
     wallet: Wallet,
+    period: Period,
     events: list[Event],
     cfg: ParserConfig,
 ) -> WalletStats:
     stats = WalletStats(
         wallet_label=wallet.label,
         wallet_address=wallet.address,
-        period_start_utc=cfg.start_utc,
-        period_end_utc=cfg.end_utc,
+        period_start_utc=period.start_utc,
+        period_end_utc=period.end_utc,
+        period_label=period.label,
     )
 
-    by_tx: dict[str, list[Event]] = defaultdict(list)
+    by_tx: dict[str, list[Event]] = {}
 
     for event in events:
-        by_tx[event.tx_hash].append(event)
+        by_tx.setdefault(event.tx_hash, []).append(event)
 
     sorted_txs = sorted(
         by_tx.items(),
-        key=lambda item: min(event.ts for event in item[1]),
+        key=lambda item: (min(event.ts for event in item[1]), item[0]),
     )
 
     for tx_hash, legs in sorted_txs:
@@ -810,15 +1062,13 @@ def classify_wallet_events(
         quote_out = Decimal(0)
 
         for event in legs:
-            contract = getattr(event, "contract_address", "")
-
-            if contract == cfg.token_main_address:
+            if event.contract_address == cfg.token_main_address:
                 if event.direction == "IN":
                     main_in += event.amount
                 elif event.direction == "OUT":
                     main_out += event.amount
 
-            elif contract == cfg.token_quote_address:
+            elif event.contract_address == cfg.token_quote_address:
                 if event.direction == "IN":
                     quote_in += event.amount
                 elif event.direction == "OUT":
@@ -834,19 +1084,16 @@ def classify_wallet_events(
                 side = "BUY"
                 main_amount = main_in
                 quote_amount = quote_out
-                price = quote_amount / main_amount if main_amount else Decimal(0)
-
                 stats.total_main_bought += main_amount
                 stats.total_quote_spent += quote_amount
-
             else:
                 side = "SELL"
                 main_amount = main_out
                 quote_amount = quote_in
-                price = quote_amount / main_amount if main_amount else Decimal(0)
-
                 stats.total_main_sold += main_amount
                 stats.total_quote_received_from_swaps += quote_amount
+
+            price = quote_amount / main_amount if main_amount else Decimal(0)
 
             for event in legs:
                 event.event_type = f"SWAP_{side}"
@@ -871,6 +1118,9 @@ def classify_wallet_events(
                 main_amount=main_amount,
                 quote_amount=quote_amount,
                 price=price,
+                period_label=period.label,
+                period_start_utc=period.start_utc,
+                period_end_utc=period.end_utc,
             ))
 
         else:
@@ -879,15 +1129,13 @@ def classify_wallet_events(
                 stats.raw_events.append(event)
                 stats.transfer_events.append(event)
 
-                contract = getattr(event, "contract_address", "")
-
-                if contract == cfg.token_main_address:
+                if event.contract_address == cfg.token_main_address:
                     if event.direction == "IN":
                         stats.main_received_transfer += event.amount
                     elif event.direction == "OUT":
                         stats.main_sent_transfer += event.amount
 
-                elif contract == cfg.token_quote_address:
+                elif event.contract_address == cfg.token_quote_address:
                     if event.direction == "IN":
                         stats.quote_received_transfer += event.amount
                     elif event.direction == "OUT":
@@ -927,31 +1175,36 @@ def replace_sheet(ss, title: str, header: list[str], data_rows: list[list[Any]])
 
 
 def write_outputs(ss, stats_list: list[WalletStats], cfg: ParserConfig):
+    # stats_list is already ordered: wallet (as in Wallets sheet) → period start
+    def ordered(events: list[Event]) -> list[Event]:
+        return sorted(events, key=lambda e: (e.ts, e.tx_hash, e.direction, e.asset))
+
     all_raw: list[Event] = []
     all_transfers: list[Event] = []
     all_swaps: list[Event] = []
 
     for stats in stats_list:
-        all_raw.extend(stats.raw_events)
-        all_transfers.extend(stats.transfer_events)
-        all_swaps.extend(stats.swap_events)
+        all_raw.extend(ordered(stats.raw_events))
+        all_transfers.extend(ordered(stats.transfer_events))
+        all_swaps.extend(ordered(stats.swap_events))
 
-    all_raw.sort(key=lambda e: (e.ts, e.wallet_label, e.tx_hash))
-    all_transfers.sort(key=lambda e: (e.ts, e.wallet_label, e.tx_hash))
-    all_swaps.sort(key=lambda e: (e.ts, e.wallet_label, e.tx_hash))
+    period_cols = ["period_label", "period_start_utc", "period_end_utc"]
+
+    def period_vals(e: Event) -> list[str]:
+        return [e.period_label, e.period_start_utc, e.period_end_utc]
 
     raw_header = [
         "datetime_utc", "wallet_label", "wallet_address", "tx_hash",
         "event_type", "asset", "amount", "direction", "from", "to",
         "counterparty", "protocol", "link",
-    ]
+    ] + period_cols
 
     raw_rows = [
         [
             event.datetime_utc, event.wallet_label, event.wallet_address, event.tx_hash,
             event.event_type, event.asset, dec_to_str(event.amount), event.direction,
             event.from_addr, event.to_addr, event.counterparty, event.protocol, event.link,
-        ]
+        ] + period_vals(event)
         for event in all_raw
     ]
 
@@ -960,14 +1213,14 @@ def write_outputs(ss, stats_list: list[WalletStats], cfg: ParserConfig):
     transfer_header = [
         "datetime_utc", "wallet_label", "wallet_address", "tx_hash",
         "asset", "direction", "amount", "from", "to", "counterparty", "link",
-    ]
+    ] + period_cols
 
     transfer_rows = [
         [
             event.datetime_utc, event.wallet_label, event.wallet_address, event.tx_hash,
             event.asset, event.direction, dec_to_str(event.amount), event.from_addr,
             event.to_addr, event.counterparty, event.link,
-        ]
+        ] + period_vals(event)
         for event in all_transfers
     ]
 
@@ -978,35 +1231,40 @@ def write_outputs(ss, stats_list: list[WalletStats], cfg: ParserConfig):
         f"{cfg.token_main_symbol.lower()}_amount",
         f"{cfg.token_quote_symbol.lower()}_amount",
         "price", "protocol", "link",
-    ]
+    ] + period_cols
 
     swap_rows = [
         [
             event.datetime_utc, event.wallet_label, event.wallet_address, event.tx_hash,
             event.side, dec_to_str(event.main_amount), dec_to_str(event.quote_amount),
             dec_to_str(event.price), event.protocol, event.link,
-        ]
+        ] + period_vals(event)
         for event in all_swaps
     ]
 
     replace_sheet(ss, "Swaps", swap_header, swap_rows)
 
+    main = cfg.token_main_symbol.lower()
+    quote = cfg.token_quote_symbol.lower()
+
     final_header = [
         "wallet_label", "wallet_address", "period_start_utc", "period_end_utc",
-        f"total_{cfg.token_main_symbol.lower()}_bought",
-        f"total_{cfg.token_quote_symbol.lower()}_spent",
+        f"total_{main}_bought",
+        f"total_{quote}_spent",
         "avg_buy_price",
-        f"total_{cfg.token_main_symbol.lower()}_sold",
-        f"total_{cfg.token_quote_symbol.lower()}_received",
+        f"total_{main}_sold",
+        f"total_{quote}_received",
         "avg_sell_price",
-        f"matched_{cfg.token_main_symbol.lower()}",
-        f"realized_pnl_{cfg.token_quote_symbol.lower()}",
-        f"{cfg.token_main_symbol.lower()}_received_transfer",
-        f"{cfg.token_main_symbol.lower()}_sent_transfer",
-        f"net_{cfg.token_main_symbol.lower()}_transfer",
-        f"{cfg.token_quote_symbol.lower()}_received_transfer",
-        f"{cfg.token_quote_symbol.lower()}_sent_transfer",
-        f"net_{cfg.token_quote_symbol.lower()}_transfer",
+        f"matched_{main}",
+        f"realized_pnl_{quote}",
+        f"{main}_received_transfer",
+        f"{main}_sent_transfer",
+        f"net_{main}_transfer",
+        f"{quote}_received_transfer",
+        f"{quote}_sent_transfer",
+        f"net_{quote}_transfer",
+        "period_label",
+        "swaps_count",
     ]
 
     final_rows = []
@@ -1028,6 +1286,8 @@ def write_outputs(ss, stats_list: list[WalletStats], cfg: ParserConfig):
             dec_to_str(stats.quote_received_transfer),
             dec_to_str(stats.quote_sent_transfer),
             dec_to_str(stats.net_quote_transfer),
+            stats.period_label,
+            len(stats.swap_events),
         ])
 
     replace_sheet(ss, "Final", final_header, final_rows)
@@ -1037,67 +1297,83 @@ def write_outputs(ss, stats_list: list[WalletStats], cfg: ParserConfig):
 # MAIN
 # =========================
 
+def process_wallet(
+    wallet: Wallet,
+    cfg: ParserConfig,
+    contract_addresses: list[str],
+) -> list[WalletStats]:
+    windows = merge_fetch_windows(wallet.periods, PERIOD_MERGE_GAP_SEC)
+
+    log.info(
+        "Fetching wallet=%s label=%s periods=%s fetch_windows=%s",
+        wallet.address, wallet.label, len(wallet.periods), len(windows),
+    )
+
+    raw_rows: list[dict] = []
+
+    for start_ts, end_ts in windows:
+        # wide by 1 block on each side; exact filtering by timestamp happens below
+        start_block = find_block_by_timestamp(start_ts, closest="before")
+        end_block = find_block_by_timestamp(end_ts, closest="after")
+
+        log.info(
+            "  window %s → %s UTC | blocks %s → %s",
+            ts_to_utc_str(start_ts), ts_to_utc_str(end_ts), start_block, end_block,
+        )
+
+        raw_rows.extend(fetch_wallet_transfers(
+            wallet.address,
+            contract_addresses,
+            from_block=int_to_hex_block(start_block),
+            to_block=int_to_hex_block(end_block),
+        ))
+
+    raw_rows = dedupe_transfers(raw_rows)
+    log.info("  raw transfers fetched: %s", len(raw_rows))
+
+    events = filter_and_normalize_rows(raw_rows, wallet, cfg)
+    results: list[WalletStats] = []
+
+    for period in wallet.periods:
+        period_events = events_for_period(events, period)
+        stats = classify_wallet_events(wallet, period, period_events, cfg)
+        results.append(stats)
+
+        log.info(
+            "  %s [%s] %s → %s: events=%s transfers=%s swaps=%s pnl=%s",
+            wallet.label, period.label, period.start_utc, period.end_utc,
+            len(period_events), len(stats.transfer_events), len(stats.swap_events),
+            dec_to_str(stats.realized_pnl_quote),
+        )
+
+    return results
+
+
 def main():
     ss = open_sheet()
 
     cfg = read_config(ss)
     wallets = read_wallets(ss)
+    period_rows = read_periods(ss)
+    wallets = build_wallet_periods(wallets, period_rows, cfg)
 
-    log.info("Loaded period: %s → %s UTC", cfg.start_utc, cfg.end_utc)
-    log.info("Loaded wallets: %s", len(wallets))
+    log.info(
+        "Mode: %s | wallets=%s | periods total=%s",
+        f"{PERIODS_SHEET} sheet" if period_rows else f"Config {cfg.start_utc} → {cfg.end_utc}",
+        len(wallets),
+        sum(len(w.periods) for w in wallets),
+    )
     log.info(
         "Tracked tokens: %s=%s | %s=%s",
         cfg.token_main_symbol, cfg.token_main_address,
         cfg.token_quote_symbol, cfg.token_quote_address,
     )
 
-    if cfg.end_ts < cfg.start_ts:
-        raise RuntimeError("end_utc must be greater than or equal to start_utc")
-
-    log.info("Finding block range for Config period...")
-    start_block = find_block_by_timestamp(cfg.start_ts, closest="after")
-    end_block = find_block_by_timestamp(cfg.end_ts, closest="before")
-
-    if start_block > end_block:
-        raise RuntimeError(
-            f"Invalid block range from period: start_block={start_block}, end_block={end_block}"
-        )
-
-    from_block = int_to_hex_block(start_block)
-    to_block = int_to_hex_block(end_block)
-
-    log.info(
-        "Block range from Config period: %s (%s) → %s (%s)",
-        start_block, from_block, end_block, to_block,
-    )
-
     contract_addresses = [cfg.token_main_address, cfg.token_quote_address]
     stats_list: list[WalletStats] = []
 
     for wallet in wallets:
-        log.info("Fetching wallet=%s label=%s", wallet.address, wallet.label)
-
-        raw_rows = fetch_wallet_transfers(
-            wallet.address,
-            contract_addresses,
-            from_block=from_block,
-            to_block=to_block,
-        )
-
-        log.info("  raw transfers fetched: %s", len(raw_rows))
-
-        events = filter_and_normalize_rows(raw_rows, wallet, cfg)
-        stats = classify_wallet_events(wallet, events, cfg)
-        stats_list.append(stats)
-
-        log.info(
-            "%s: in_period_events=%s transfers=%s swaps=%s pnl=%s",
-            wallet.label,
-            len(events),
-            len(stats.transfer_events),
-            len(stats.swap_events),
-            dec_to_str(stats.realized_pnl_quote),
-        )
+        stats_list.extend(process_wallet(wallet, cfg, contract_addresses))
 
     write_outputs(ss, stats_list, cfg)
 
